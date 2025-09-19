@@ -67,7 +67,7 @@ util::Status VerifySpec(const TrainerSpec &trainer_spec) {
 #define CHECK_RANGE(variable, minval, maxval) \
   CHECK_OR_RETURN(variable >= minval && variable <= maxval)
 
-  CHECK_RANGE(trainer_spec.character_coverage(), 0.98, 1.0);
+/* CHECK_RANGE(trainer_spec.character_coverage(), 0.98, 1.0);*/
   CHECK_RANGE(trainer_spec.max_sentencepiece_length(), 1, 512);
   CHECK_RANGE(trainer_spec.num_sub_iterations(), 1, 10);
   CHECK_RANGE(trainer_spec.num_threads(), 1, 1024);
@@ -581,7 +581,7 @@ END:
 
   if (trainer_spec_.model_type() != TrainerSpec::WORD &&
       trainer_spec_.model_type() != TrainerSpec::CHAR) {
-    CHECK_LE_OR_RETURN(
+    /*CHECK_LE_OR_RETURN(
         static_cast<int>(required_chars_.size() + meta_pieces_.size()),
         trainer_spec_.vocab_size())
         << "Vocabulary size is smaller than required_chars. "
@@ -589,6 +589,7 @@ END:
         << required_chars_.size() + meta_pieces_.size() << ". "
         << "Increase vocab_size or decrease character_coverage with "
         << "--character_coverage option.";
+	*/
   }
 
   LOG(INFO) << "Done! preprocessed " << sentences_.size() << " sentences.";
@@ -643,6 +644,9 @@ util::Status TrainerInterface::Serialize(ModelProto *model_proto) const {
       CHECK_PIECE(sp->piece());
     }
   }
+  LOG(INFO) << "AGGGG " 
+            << final_pieces_.size()
+            << " " << fid;
 
   CHECK_EQ_OR_RETURN(fid, final_pieces_.size());
 
