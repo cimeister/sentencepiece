@@ -45,6 +45,84 @@ double Digamma(double x) {
   return result;
 }
 
+inline bool ParseFloat(const std::string& s, float* out) {
+  errno = 0;
+  char* end = nullptr;
+  const double v = std::strtod(s.c_str(), &end);
+  if (end == s.c_str() || errno != 0 || !std::isfinite(v)) return false;
+  *out = static_cast<float>(v);
+  return true;
+}
+
+template <typename IT>
+void ToLogProb(IT begin, IT end) {
+  double sum = 0.0;
+  for (auto it = begin; it != end; ++it) sum += static_cast<double>(it->second);
+  if (sum <= 0.0) return;
+  const double logsum = std::log(sum);
+  for (auto it = begin; it != end; ++it) {
+    it->second = static_cast<float>(std::log(static_cast<double>(it->second)) - logsum);
+  }
+}
+
+// Simple bounded max-heap used by SP’s seeding code.
+template <class T>
+class BoundedPriorityQueue {
+ public:
+  explicit BoundedPriorityQueue(size_t size) : size_(size) {}
+  void push(T elem, int64_t score) {
+    if (queue_.size() > 4 * size_) resize_();
+    if (sorted_ && queue_.size() >= size_ && queue_[size_ - 1].second > score) return;
+    queue_.emplace_back(elem, score);
+  }
+  const std::vector<std::pair<T, int64_t>>& get() {
+    resize_();
+    return queue_;
+  }
+ private:
+  void resize_() {
+    std::sort(queue_.begin(), queue_.end(), [](const auto& a, const auto& b) {
+      return (a.second > b.second) || (a.second == b.second && a.first < b.first);
+    });
+    sorted_ = true;
+    if (queue_.size() > size_) queue_.resize(size_);
+  }
+  bool sorted_ = false;
+  size_t size_ = 0;
+  std::vector<std::pair<T, int64_t>> queue_;
+};
+
+static double L1DeltaByPiece(
+    const sentencepiece::unigram::TrainerModel::SentencePieces& old_sp,
+    const sentencepiece::unigram::TrainerModel::SentencePieces& new_sp) {
+  CHECK_EQ(old_sp.size(), new_sp.size());
+  const int K = static_cast<int>(old_sp.size());
+  if (K == 0) return 0.0;
+
+  // logZ(old)
+  double max_old = -std::numeric_limits<double>::infinity();
+  for (const auto& w : old_sp) max_old = std::max<double>(max_old, w.second);
+  double sum_old = 0.0;
+  for (const auto& w : old_sp) sum_old += std::exp(static_cast<double>(w.second) - max_old);
+  const double logZ_old = max_old + std::log(sum_old);
+
+  // logZ(new)
+  double max_new = -std::numeric_limits<double>::infinity();
+  for (const auto& w : new_sp) max_new = std::max<double>(max_new, w.second);
+  double sum_new = 0.0;
+  for (const auto& w : new_sp) sum_new += std::exp(static_cast<double>(w.second) - max_new);
+  const double logZ_new = max_new + std::log(sum_new);
+
+  // L1 = sum_i |p_new(i) - p_old(i)|
+  double l1 = 0.0;
+  for (int i = 0; i < K; ++i) {
+    const double p_old = std::exp(static_cast<double>(old_sp[i].second) - logZ_old);
+    const double p_new = std::exp(static_cast<double>(new_sp[i].second) - logZ_new);
+    l1 += std::abs(p_new - p_old);
+  }
+  return l1;
+}
+
 }  // namespace
 
 TrainerModel::TrainerModel(const TrainerSpec &trainer_spec,
@@ -82,53 +160,212 @@ void TrainerModel::SetSentencePieces(SentencePieces &&sentencepieces) {
 }
 
 TrainerModel::SentencePieces Trainer::MakeSeedSentencePieces() {
-  return MakeSeedSentencePiecesInternal<int32_t>();
+  return trainer_spec_.train_extremely_large_corpus()
+             ? MakeSeedSentencePiecesInternal<int64_t>()
+             : MakeSeedSentencePiecesInternal<int32_t>();
 }
 
-// Simple seed loader: dedup, drop UNK (SP will add meta UNK).
+
 template <typename node_int_type>
 TrainerModel::SentencePieces Trainer::MakeSeedSentencePiecesInternal() {
   TrainerModel::SentencePieces seed_sentencepieces;
-  CHECK(!trainer_spec_.seed_sentencepieces_file().empty())
-      << "Requires --seed_sentencepieces_file to be set.";
 
-  LOG(INFO) << "Loading pieces from seed file (dedup; drop UNK)...";
+  // Branch A: if a seed file is provided, behave exactly like your fixed-vocab path.
+  if (!trainer_spec_.seed_sentencepieces_file().empty()) {
+    LOG(INFO) << "Loading pieces from seed file (dedup; drop UNK)…";
+    auto input = sentencepiece::filesystem::NewReadableFile(
+        trainer_spec_.seed_sentencepieces_file());
+    CHECK(input != nullptr) << "Cannot open: "
+                            << trainer_spec_.seed_sentencepieces_file();
 
-  auto input = sentencepiece::filesystem::NewReadableFile(
-      trainer_spec_.seed_sentencepieces_file());
-  CHECK(input != nullptr) << "Cannot open: "
-                          << trainer_spec_.seed_sentencepieces_file();
+    absl::flat_hash_map<std::string, char> seen;  // use as a set
+    const std::string unk = trainer_spec_.unk_piece().empty()
+                                ? std::string("<unk>")
+                                : trainer_spec_.unk_piece();
 
-  absl::flat_hash_map<std::string, char> seen;  // use as a set
-  const std::string unk =
-      trainer_spec_.unk_piece().empty() ? std::string("<unk>")
-                                        : trainer_spec_.unk_piece();
-
-  std::string line;
-  while (input->ReadLine(&line)) {
-    if (line.empty()) continue;
-    const std::vector<std::string> fields = absl::StrSplit(line, '\t');
-    if (fields.size() != 2) {
-      LOG(WARNING) << "Skipping invalid seed line: " << line;
-      continue;
+    std::string line;
+    while (input->ReadLine(&line)) {
+      if (line.empty()) continue;
+      const std::vector<std::string> fields = absl::StrSplit(line, '\t');
+      if (fields.size() != 2) {
+        LOG(WARNING) << "Skipping invalid seed line: " << line;
+        continue;
+      }
+      const std::string& piece = fields[0];
+      if (piece == unk) {
+        LOG(WARNING) << "Dropping UNK from seed: " << piece;
+        continue;
+      }
+      if (seen.emplace(piece, 1).second) {
+        float score = 0.0f;
+        // be tolerant of parse errors
+        if (!ParseFloat(fields[1], &score)) {
+          score = 0.0f;  // tolerant fallback
+        }
+        seed_sentencepieces.emplace_back(piece, score);
+      }
     }
-    const std::string &piece = fields[0];
-    if (piece == unk) {
-      // Drop UNK from seed; SP will add meta UNK.
-      LOG(WARNING) << "Dropping UNK from seed: " << piece;
-      continue;
-    }
-    if (seen.emplace(piece, 1).second) {
-      float score = 0.0f;
-      // Be tolerant of parse errors.
-      try { score = std::stof(fields[1]); } catch (...) { score = 0.0f; }
-      seed_sentencepieces.emplace_back(piece, score);
-    }
+
+    LOG(INFO) << "Initialized " << seed_sentencepieces.size()
+              << " seed sentencepieces (deduped; UNK excluded).";
+    return seed_sentencepieces;
   }
 
-  LOG(INFO) << "Initialized " << seed_sentencepieces.size()
-            << " seed sentencepieces (deduped; UNK excluded).";
-  return seed_sentencepieces;
+  // Branch B: no seed file.
+  // If num_sub_iterations == 0, build a seed vocabulary from the corpus
+  // using the original suffix-array seeding and save it (no EM).
+  // --- inside Trainer::MakeSeedSentencePiecesInternal<node_int_type>() ---
+  if (trainer_spec_.num_sub_iterations() == 0 &&
+      trainer_spec_.seed_sentencepieces_file().empty()) {
+    TrainerModel::SentencePieces seed_sentencepieces;
+
+    // Build UTF-32 stream + unigram counts from the corpus (as before).
+    const auto* pretokenizer = SentencePieceTrainer::GetPretokenizerForTraining();
+    auto pretokenize_or_rewrite = [&](std::pair<std::string, int64_t>* w) {
+      if (pretokenizer) {
+        std::vector<char32> chars;
+        for (const auto& t : pretokenizer->PreTokenize(w->first)) {
+          for (const auto& c : string_util::UTF8ToUnicodeText(t)) chars.push_back(c);
+          chars.push_back(kSentenceBoundary);
+        }
+        return chars;
+      } else if (!trainer_spec_.pretokenization_delimiter().empty()) {
+        std::vector<char32> chars;
+        absl::string_view delim = trainer_spec_.pretokenization_delimiter();
+        for (const auto& part : absl::StrSplit(w->first, delim)) {
+          for (const auto& c : string_util::UTF8ToUnicodeText(part)) chars.push_back(c);
+          chars.push_back(kSentenceBoundary);
+        }
+        w->first = absl::StrReplaceAll(w->first, {{delim, ""}});
+        return chars;
+      }
+      return string_util::UTF8ToUnicodeText(w->first);
+    };
+
+    std::vector<char32> array;
+    absl::flat_hash_map<std::string, int64_t> all_chars;  // UTF-8 char -> freq
+    const bool is_tsv = trainer_spec_.input_format() == "tsv";
+
+    for (auto& w : sentences_) {
+      const auto ut = pretokenize_or_rewrite(&w);
+      for (const auto& c : ut) {
+        array.push_back(c);
+        if (c != kSentenceBoundary) {
+          all_chars[string_util::UnicodeCharToUTF8(c)] += w.second;
+        }
+      }
+      array.push_back(kSentenceBoundary);
+      if (is_tsv) {  // oversample (parity with upstream)
+        for (const auto& c : ut) array.push_back(c);
+        array.push_back(kSentenceBoundary);
+      }
+    }
+
+    // ---- Budgeting: vocab_size = meta + required_chars + SA_substrings ----
+    const int vocab_size = trainer_spec_.vocab_size();
+    const int meta_n = static_cast<int>(meta_pieces_.size());  // UNK/BOS/EOS/etc.
+    int budget = vocab_size - meta_n;
+    CHECK_GT(budget, 0) << "vocab_size too small after accounting for meta pieces.";
+
+    // 1) Fill required_chars_ first (alphabet from character_coverage).
+    //    We score alphabet chars by their corpus frequency for a sensible ordering.
+    struct CharFreq { std::string ch; int64_t freq; };
+    std::vector<CharFreq> alphabet;
+    alphabet.reserve(required_chars_.size());
+    for (const auto& w : Sorted(required_chars_)) {
+      const std::string s = string_util::UnicodeCharToUTF8(w.first);
+      const auto it = all_chars.find(s);
+      const int64_t f = (it == all_chars.end()) ? 1 : it->second;
+      alphabet.push_back({s, f});
+    }
+    // Highest freq first (stable with lexicographic tie-break in Sorted).
+    std::sort(alphabet.begin(), alphabet.end(),
+              [](const CharFreq& a, const CharFreq& b) {
+                return (a.freq > b.freq) || (a.freq == b.freq && a.ch < b.ch);
+              });
+
+    if (static_cast<int>(alphabet.size()) > budget) {
+      LOG(WARNING) << "required_chars_ (" << alphabet.size()
+                   << ") exceeds available budget (" << budget
+                   << "). Trimming least frequent required chars to fit.";
+      alphabet.resize(budget);
+    }
+
+    absl::flat_hash_map<std::string, char> taken;  // to avoid duplicates
+    for (const auto& cf : alphabet) {
+      seed_sentencepieces.emplace_back(cf.ch, static_cast<float>(cf.freq));
+      taken.emplace(cf.ch, 1);
+    }
+    int remaining = budget - static_cast<int>(seed_sentencepieces.size());
+    if (remaining <= 0) {
+      ToLogProb(seed_sentencepieces.begin(), seed_sentencepieces.end());
+      LOG(INFO) << "Initialized " << seed_sentencepieces.size()
+                << " seed sentencepieces (alphabet-only; budget filled).";
+      return seed_sentencepieces;
+    }
+
+    // 2) Fill the remainder with frequent substrings via suffix array.
+    CHECK_LE(array.size(),
+             static_cast<size_t>(std::numeric_limits<node_int_type>::max()))
+        << "Input corpus too large, try with train_extremely_large_corpus=true";
+    const node_int_type n = static_cast<node_int_type>(array.size());
+    std::vector<node_int_type> SA(n), L(n), R(n), D(n);
+
+    constexpr node_int_type kAlphabetSize = 0x110000;  // UCS-4
+    node_int_type node_num = 0;
+    LOG(INFO) << "Making suffix array…";
+    CHECK_EQ(0, esaxx(array.begin(), SA.begin(), L.begin(), R.begin(),
+                      D.begin(), n, kAlphabetSize, node_num));
+
+    LOG(INFO) << "Extracting frequent substrings with remaining budget: " << remaining;
+    BoundedPriorityQueue<node_int_type> queue(static_cast<size_t>(remaining));
+
+    for (node_int_type i = 0; i < node_num; ++i) {
+      const node_int_type offset = SA[L[i]];
+      const node_int_type len = D[i];
+      if (len <= 1 || static_cast<size_t>(offset + len) >= array.size()) continue;
+
+      const char32* begin = &array[offset];
+      const char32* end   = &array[offset + len];
+      if (std::find(begin, end, kSentenceBoundary) != end) continue;
+
+      const UnicodeText uw(begin, end);
+      if (!IsValidSentencePiece(uw)) continue;
+
+      const std::string w = string_util::UnicodeTextToUTF8(uw);
+      if (taken.find(w) != taken.end()) continue;  // skip alphabet duplicates
+
+      const node_int_type freq = R[i] - L[i];
+      const node_int_type score = freq * len;  // char-coverage score
+      queue.push(i, score);
+    }
+
+    for (const auto& p : queue.get()) {
+      if (remaining <= 0) break;
+      const node_int_type offset = SA[L[p.first]];
+      const node_int_type len = D[p.first];
+      const char32* begin = &array[offset];
+      const char32* end   = &array[offset + len];
+      const UnicodeText uw(begin, end);
+      const std::string w = string_util::UnicodeTextToUTF8(uw);
+      if (taken.emplace(w, 1).second) {
+        seed_sentencepieces.emplace_back(w, static_cast<float>(p.second));
+        --remaining;
+      }
+    }
+
+    ToLogProb(seed_sentencepieces.begin(), seed_sentencepieces.end());
+    LOG(INFO) << "Initialized " << seed_sentencepieces.size()
+              << " seed sentencepieces (alphabet+" << (budget - static_cast<int>(alphabet.size()))
+              << " SA substrings), meta=" << meta_n
+              << ", final target vocab_size=" << vocab_size;
+    return seed_sentencepieces;
+  }
+
+  // Otherwise (no seed file, but EM was requested): keep your invariant.
+  CHECK(false) << "No seed file provided. For corpus-based seeding set "
+                  "--num_sub_iterations=0 (no EM).";
+  return seed_sentencepieces;  // unreachable
 }
 
 
@@ -235,30 +472,41 @@ util::Status Trainer::Train() {
     SplitSentencesByWhitespace();
   }
 
+  const int subiters = trainer_spec_.num_sub_iterations();
+  if (subiters == 0) {
+    LOG(INFO) << "num_sub_iterations=0: seed-only training (no EM). Saving model.";
+    final_pieces_ = FinalizeSentencePieces(model);
+    return Save();
+  }
+
   LOG(INFO) << "Using " << sentences_.size() << " sentences for EM training";
   desired_vocab_size_ = trainer_spec_.vocab_size();
 
-  while (true) {
-    for (int iter = 0; iter < trainer_spec_.num_sub_iterations(); ++iter) {
-      float objective = 0.0;
-      int64_t num_tokens = 0;
-      const auto expected = RunEStep(model, &objective, &num_tokens);
-      auto new_sentencepieces = RunMStep(model, expected);
-      model.SetSentencePieces(std::move(new_sentencepieces));
-      LOG(INFO) << "EM sub_iter=" << iter << " size=" << model.GetPieceSize()
-                << " obj=" << objective << " num_tokens=" << num_tokens
-                << " num_tokens/piece="
-                << (model.GetPieceSize() > 0 ? (1.0 * num_tokens / model.GetPieceSize()) : 0.0);
-    }
-    LOG(INFO) << "Fixed vocabulary training complete. Breaking main EM loop.";
-    break;
-    // The original PruneSentencePieces call is disabled.
-    // auto new_sentencepieces = PruneSentencePieces(model, desired_vocab_size_);
-    // model.SetSentencePieces(std::move(new_sentencepieces));
+  // Fixed-vocab EM (your current behavior).
+  for (int iter = 0; iter < subiters; ++iter) {
+    float objective = 0.0f;
+    int64_t num_tokens = 0;
+    const auto expected = RunEStep(model, &objective, &num_tokens);
+    const auto& old_pieces = model.GetSentencePieces();
+    auto new_sentencepieces = RunMStep(model, expected);
+    const double l1_delta = L1DeltaByPiece(old_pieces, new_sentencepieces);
+    const double tv = 0.5 * l1_delta;  // total variation distance
+    model.SetSentencePieces(std::move(new_sentencepieces));
+    LOG(INFO) << "EM sub_iter=" << iter
+              << " size=" << model.GetPieceSize()
+              << " obj=" << objective
+              << " num_tokens=" << num_tokens
+              << " num_tokens/piece="
+              << (model.GetPieceSize() > 0
+                    ? (1.0 * num_tokens / model.GetPieceSize()) : 0.0)
+              << " L1Δ=" << l1_delta
+              << " TV=" << tv;
   }
 
+  LOG(INFO) << "Fixed vocabulary training complete.";
   final_pieces_ = FinalizeSentencePieces(model);
   return Save();
 }
+
 }  // namespace unigram
 }  // namespace sentencepiece

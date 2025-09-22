@@ -69,7 +69,7 @@ util::Status VerifySpec(const TrainerSpec &trainer_spec) {
 
 /* CHECK_RANGE(trainer_spec.character_coverage(), 0.98, 1.0);*/
   CHECK_RANGE(trainer_spec.max_sentencepiece_length(), 1, 512);
-  CHECK_RANGE(trainer_spec.num_sub_iterations(), 1, 10);
+  CHECK_RANGE(trainer_spec.num_sub_iterations(), 0, 20);
   CHECK_RANGE(trainer_spec.num_threads(), 1, 1024);
   CHECK_RANGE(trainer_spec.self_test_sample_size(), 0, 1000);
   CHECK_RANGE(trainer_spec.shrinking_factor(), 0.5, 0.95);
@@ -644,11 +644,12 @@ util::Status TrainerInterface::Serialize(ModelProto *model_proto) const {
       CHECK_PIECE(sp->piece());
     }
   }
-  LOG(INFO) << "AGGGG " 
-            << final_pieces_.size()
-            << " " << fid;
+  // LOG(INFO) << "LOGGG: " << fid << " "
+  //           << final_pieces_.size();
 
   CHECK_EQ_OR_RETURN(fid, final_pieces_.size());
+  LOG(INFO) << "Vocab size: " 
+            << final_pieces_.size();
 
   *(model_proto->mutable_trainer_spec()) = trainer_spec_;
   *(model_proto->mutable_normalizer_spec()) = normalizer_spec_;
