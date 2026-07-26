@@ -58,6 +58,21 @@ inline float LogSumExp(float x, float y, bool init_mode) {
   }
 }
 
+// Double-precision LogSumExp, used by the trainer's forward-backward only.
+inline double LogSumExpD(double x, double y, bool init_mode) {
+  if (init_mode) {
+    return y;
+  }
+  const double vmin = std::min(x, y);
+  const double vmax = std::max(x, y);
+  constexpr double kMinusLogEpsilonD = 50;
+  if (vmax > vmin + kMinusLogEpsilonD) {
+    return vmax;
+  } else {
+    return vmax + std::log(std::exp(vmin - vmax) + 1.0);
+  }
+}
+
 // Returns a sample from a standard Gumbel distribution.
 // If U  ~ U[0, 1], -log(-log U) ~ G(0,1)
 inline float Gumbel() {
@@ -232,6 +247,42 @@ std::vector<float> Lattice::BackwardAlgorithm(float inv_theta) const {
   return beta;
 }
 
+std::vector<double> Lattice::ForwardAlgorithmD() const {
+  const int len = size();
+  std::vector<double> alpha(node_allocator_.size(), 0.0);
+
+  for (int pos = 0; pos <= len; ++pos) {
+    for (Node *rnode : begin_nodes_[pos]) {
+      for (Node *lnode : end_nodes_[pos]) {
+        alpha[rnode->node_id] =
+            LogSumExpD(alpha[rnode->node_id],
+                       static_cast<double>(lnode->score) + alpha[lnode->node_id],
+                       lnode == end_nodes_[pos][0]);
+      }
+    }
+  }
+
+  return alpha;
+}
+
+std::vector<double> Lattice::BackwardAlgorithmD() const {
+  const int len = size();
+  std::vector<double> beta(node_allocator_.size(), 0.0);
+
+  for (int pos = len; pos >= 0; --pos) {
+    for (Node *lnode : end_nodes_[pos]) {
+      for (Node *rnode : begin_nodes_[pos]) {
+        beta[lnode->node_id] =
+            LogSumExpD(beta[lnode->node_id],
+                       static_cast<double>(rnode->score) + beta[rnode->node_id],
+                       rnode == begin_nodes_[pos][0]);
+      }
+    }
+  }
+
+  return beta;
+}
+
 float Lattice::PopulateMarginal(float freq,
                                 std::vector<float> *expected) const {
   if (expected == nullptr) return 0.0;
@@ -241,23 +292,23 @@ float Lattice::PopulateMarginal(float freq,
   // alpha and beta (accumulative log prob) in Forward Backward.
   // the index of alpha/beta is Node::node_id.
 
-  const auto alpha = ForwardAlgorithm(1.0);
-  const auto beta = BackwardAlgorithm(1.0);
+  const auto alpha = ForwardAlgorithmD();
+  const auto beta = BackwardAlgorithmD();
 
-  const float Z = alpha[begin_nodes_[len][0]->node_id];
+  const double Z = alpha[begin_nodes_[len][0]->node_id];
   for (int pos = 0; pos < len; ++pos) {
     for (Node *node : begin_nodes_[pos]) {
       if (node->id >= 0) {
         // the index of |expected| is a Node::id, which is a vocabulary id.
         (*expected)[node->id] +=
-            freq *
-            std::exp(static_cast<double>(alpha[node->node_id] + node->score +
-                                         beta[node->node_id] - Z));
+            freq * std::exp(alpha[node->node_id] +
+                            static_cast<double>(node->score) +
+                            beta[node->node_id] - Z);
       }
     }
   }
 
-  return freq * Z;
+  return static_cast<float>(freq * Z);
 }
 
 float Lattice::CalculateEntropy(float inv_theta) const {

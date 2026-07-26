@@ -113,6 +113,12 @@ class Lattice {
   float PopulateMarginal(float freq, std::vector<float> *expected) const;
 
  private:
+  // Double-precision forward/backward with theta == 1.0, used only by
+  // PopulateMarginal.  The float versions above lose enough precision on long
+  // sentences to make alpha + score + beta - Z positive by hundreds of nats.
+  std::vector<double> ForwardAlgorithmD() const;
+  std::vector<double> BackwardAlgorithmD() const;
+
   // Returns new node.
   // Lattice class has the ownership of the returned value.
   Node *NewNode();
