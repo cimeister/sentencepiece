@@ -432,7 +432,10 @@ TrainerModel::SentencePieces Trainer::RunMStep(
   std::vector<double> mass(K);
   for (int i = 0; i < K; ++i) {
     double ni = static_cast<double>(expected[i]);
-    if (!std::isfinite(ni) || ni < 0.0) ni = 0.0;
+    CHECK(std::isfinite(ni) && ni >= 0.0)
+        << "non-finite or negative expected count for piece " << i
+        << "; the E-step produced an invalid marginal (this must never happen "
+        << "with the double-precision forward-backward).";
     mass[i] = ni;
     sum_counts += ni;
   }
